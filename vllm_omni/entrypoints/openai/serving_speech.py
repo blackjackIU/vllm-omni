@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -553,7 +554,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         For VoxCPM2 this shifts ~15s of torch.compile + CUDA Graph capture from
         the first user request to server startup.
         """
-        if self._tts_model_type != "voxcpm2":
+        is_voxcpm2 = self._tts_model_type == "voxcpm2"
+        stage_key = getattr(
+            getattr(getattr(self, "_tts_stage", None), "engine_args", None),
+            "model_stage",
+            None,
+        )
+        is_native_vibevoice = self._tts_model_type == "vibevoice" and stage_key != "vibevoice_legacy"
+        if not is_voxcpm2 and not is_native_vibevoice:
             return
 
         t0 = time.time()
@@ -561,17 +569,48 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # VoxCPM2 has no predefined speaker presets — "default" means zero-shot
         # mode (no voice cloning).  The voice field is required by the OpenAI
         # API schema but semantically ignored by the model.
+        warmup_extra = None
+        if is_native_vibevoice:
+            warmup_extra = {
+                "disable_prefill": True,
+                "cfg_scale": 1.3,
+                "ddpm_steps": 5,
+                "max_new_tokens": 16,
+                "seed": 0,
+            }
         warmup_req = OpenAICreateSpeechRequest(
             input="Warmup.",
-            voice="default",
+            voice=None if is_native_vibevoice else "default",
             response_format="wav",
             speed=1.0,
             stream=False,
             model=self.model_name,
+            extra_params=warmup_extra,
         )
         try:
-            _audio_bytes, _media_type = await self._generate_audio_bytes(warmup_req, request_id="speech-warmup")
+            replicas = 1
+            if is_native_vibevoice:
+                runtime = getattr(getattr(self, "_tts_stage", None), "runtime", None)
+                if isinstance(runtime, dict):
+                    replicas = int(runtime.get("num_replicas", 1) or 1)
+                else:
+                    replicas = int(getattr(runtime, "num_replicas", 1) or 1)
+            await asyncio.gather(
+                *(
+                    self._generate_audio_bytes(
+                        copy.deepcopy(warmup_req),
+                        request_id=f"speech-warmup-{replica_index}",
+                    )
+                    for replica_index in range(replicas)
+                )
+            )
         except Exception as exc:
+            if is_native_vibevoice:
+                # Native VibeVoice warmup exercises the real AR/CFG/diffusion
+                # stage. Continuing after an EngineDeadError leaves a healthy-
+                # looking HTTP process with no live model replica.
+                logger.exception("Native VibeVoice speech warmup failed; aborting startup")
+                raise
             logger.warning("Speech warmup failed (non-fatal): %s", exc)
             return
 
@@ -627,6 +666,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             except Exception as e:
                 logger.warning(f"Failed to derive Ming codec frame rate from hf_config: {e}")
 
+        # Composite/native-audio models can expose their frame rate directly
+        # and do not necessarily have a nested speech_tokenizer/config.json.
+        try:
+            hf_config = self.engine_client.model_config.hf_config
+            rate = getattr(hf_config, "codec_frame_rate_hz", None)
+            if rate is not None:
+                logger.info("Using codec frame rate from hf_config: %s Hz", rate)
+                return float(rate)
+        except Exception:
+            pass
+
         try:
             model_path = self.engine_client.model_config.model
             st_config_path = os.path.join(model_path, "speech_tokenizer", "config.json")
@@ -649,15 +699,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.warning("Failed to load codec frame rate from speech tokenizer config: %s", e)
 
-        # Fallback: try codec_frame_rate_hz from hf_config
-        try:
-            hf_config = self.engine_client.model_config.hf_config
-            rate = getattr(hf_config, "codec_frame_rate_hz", None)
-            if rate is not None:
-                logger.info("Using codec frame rate from hf_config: %s Hz", rate)
-                return float(rate)
-        except Exception:
-            pass
         return None
 
     def shutdown(self) -> None:
@@ -908,8 +949,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             try:
                 from transformers import AutoTokenizer
 
+                model_config = self.engine_client.model_config
+                # Some speech checkpoints (notably VibeVoice) keep their
+                # actual text tokenizer in a separate repository.  The stage
+                # config already resolves that repository into
+                # ``model_config.tokenizer``; loading from ``model`` here
+                # instead makes AutoTokenizer inspect the acoustic checkpoint
+                # and produces a misleading warning after otherwise successful
+                # synthesis.
+                tokenizer_name = getattr(model_config, "tokenizer", None) or model_config.model
                 self._usage_text_tokenizer = AutoTokenizer.from_pretrained(
-                    self.engine_client.model_config.model, trust_remote_code=True
+                    tokenizer_name, trust_remote_code=True
                 )
             except Exception as e:  # pragma: no cover - environment dependent
                 logger.warning("Usage: could not load a text tokenizer (%s); text_tokens will be 0", e)
@@ -3216,11 +3266,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Non-streaming is FINAL_ONLY, so the stage-0 output carries the full
             # token sequence; the counter records its length for output_tokens.
             usage_acc = SpeechOutputTokenCounter()
+            latest_generated_token_ids: list[int] = []
             audio_res: OmniRequestOutput | None = None
             aligner_res: OmniRequestOutput | None = None
             async for res in generator:
                 final_output = res
                 usage_acc.observe(res)
+                # Keep a bounded diagnostic trace for native audio models. The
+                # final single-stage output normally carries the cumulative
+                # generated special-token sequence even when it carries no
+                # PCM. This makes a zero-audio failure diagnosable from the
+                # HTTP error instead of relying on worker-subprocess stdout.
+                for completion in getattr(res, "outputs", None) or ():
+                    token_ids = getattr(completion, "token_ids", None)
+                    if token_ids:
+                        latest_generated_token_ids = [int(token) for token in token_ids[-64:]]
                 # The generator yields both the audio output (Code2Wav) and, with
                 # a forced-aligner stage, a timestamps output. Keep the audio res
                 # for the WAV and the aligner res for word timestamps.
@@ -3319,10 +3379,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if audio_tensor.ndim > 1:
                 audio_tensor = audio_tensor.squeeze()
 
-            if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and int(np.size(audio_tensor)) == 0:
-                # Audex contract: zero codec tokens must fail the request, not
-                # serialize as an empty-but-successful WAV.
-                raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
+            if (
+                self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES
+                or self._tts_model_type == "vibevoice"
+            ) and int(np.size(audio_tensor)) == 0:
+                # Native audio generators must fail loudly when their LM exits
+                # without emitting a codec/diffusion unit.  Returning a
+                # 44-byte WAV header as HTTP 200 hides model parity failures.
+                raise ValueError(
+                    f"{self._tts_model_type} produced no audio "
+                    "(the language model emitted zero valid audio units); "
+                    f"generated_token_ids={latest_generated_token_ids}"
+                )
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,

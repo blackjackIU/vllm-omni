@@ -394,6 +394,22 @@ class TestSpeechAPI:
         assert response.headers["x-vllm-omni-input-text-tokens"] == "2"
         assert response.headers["x-vllm-omni-input-audio-tokens"] == "0"
 
+    def test_usage_tokenizer_prefers_stage_tokenizer_over_model_path(self, mocker: MockerFixture):
+        server = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+        server._tts_tokenizer = None
+        server._usage_text_tokenizer = None
+        server.engine_client = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="/data/models/VibeVoice-1.5B",
+                tokenizer="Qwen/Qwen2.5-1.5B",
+            )
+        )
+        expected = mocker.MagicMock()
+        load = mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=expected)
+
+        assert server._get_usage_text_tokenizer() is expected
+        load.assert_called_once_with("Qwen/Qwen2.5-1.5B", trust_remote_code=True)
+
     def test_build_speech_usage_headers_uses_usage_and_detail_field_names(self):
         usage = SpeechTokenUsage(
             input_tokens=7,

@@ -70,6 +70,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("POST", "/v1/audio/speech"),
     ("POST", "/v1/audio/speech/batch"),
     ("POST", "/v1/audio/generate"),
+    ("GET", "/v1/audio/capabilities"),
     ("GET", "/v1/audio/voices"),
     ("POST", "/v1/audio/voices"),
     ("DELETE", "/v1/audio/voices/{name}"),
@@ -558,6 +559,119 @@ def test_health_without_engine_returns_stable_unhealthy_response() -> None:
         "status": "unhealthy",
         "reason": "No engine initialized",
     }
+
+
+def test_vibevoice_native_capabilities_reflect_resolved_deployment() -> None:
+    engine_args = SimpleNamespace(
+        model_stage="vibevoice",
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        tensor_parallel_size=1,
+        compilation_config={"cudagraph_mode": "PIECEWISE"},
+    )
+    state = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(
+                engine_args=engine_args,
+                runtime=SimpleNamespace(num_replicas=2),
+            )
+        ]
+    )
+
+    assert api_server._vibevoice_deployment_capabilities(state) == {
+        "backend": "vibevoice_native",
+        "attention": "vllm_paged_attention",
+        "cfg_kv_streams": 2,
+        "continuous_batching": True,
+        "chunked_prefill": True,
+        "prefix_caching": True,
+        "cuda_graph": None,
+        "cuda_graph_configured": True,
+        "runtime_verified": False,
+        "replicas": 2,
+        "tensor_parallel_size": 1,
+        "worker_runtime_report": "VIBEVOICE_CAPABILITIES",
+    }
+
+
+def test_vibevoice_legacy_capabilities_do_not_overclaim_native_features() -> None:
+    state = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(
+                engine_args=SimpleNamespace(
+                    model_stage="vibevoice_legacy",
+                    enable_chunked_prefill=False,
+                    enable_prefix_caching=False,
+                    compilation_config={"cudagraph_mode": "NONE"},
+                ),
+                runtime={"num_replicas": 1},
+            )
+        ]
+    )
+
+    capabilities = api_server._vibevoice_deployment_capabilities(state)
+    assert capabilities is not None
+    assert capabilities["backend"] == "vibevoice_legacy_reference"
+    assert capabilities["attention"] == "huggingface_dynamic_cache"
+    assert capabilities["cfg_kv_streams"] == 0
+    assert capabilities["continuous_batching"] is False
+    assert capabilities["cuda_graph"] is False
+    assert capabilities["cuda_graph_configured"] is False
+    assert capabilities["runtime_verified"] is True
+    assert capabilities["runtime_report_count"] == 1
+    assert capabilities["all_replicas_reported"] is True
+
+
+def test_vibevoice_capabilities_merge_observed_worker_backends() -> None:
+    class _Engine:
+        async def collective_rpc(self, **kwargs):
+            assert kwargs["method"] == "get_model_runtime_capabilities"
+            return [
+                [
+                    {
+                        "supported": True,
+                        "backend": "vibevoice_native",
+                        "cuda_graph_captured": True,
+                        "diffusion_compiled": True,
+                        "codec_compiled": True,
+                        "negative_qwen_compiled": True,
+                        "negative_cuda_graph": True,
+                        "negative_cuda_graph_configured_batch_sizes": [1, 2, 4, 8],
+                        "negative_cuda_graph_batch_sizes": [1],
+                        "positive_attention_impl": ["FlashAttentionImpl"],
+                        "negative_attention_impl": ["FlashAttentionImpl"],
+                    }
+                ]
+            ]
+
+    state = SimpleNamespace(
+        engine_client=_Engine(),
+        stage_configs=[
+            SimpleNamespace(
+                engine_args=SimpleNamespace(
+                    model_stage="vibevoice",
+                    enable_chunked_prefill=True,
+                    enable_prefix_caching=True,
+                    tensor_parallel_size=1,
+                    compilation_config={"cudagraph_mode": "PIECEWISE"},
+                ),
+                runtime={"num_replicas": 1},
+            )
+        ],
+    )
+
+    capabilities = asyncio.run(api_server._verified_vibevoice_capabilities(state))
+    assert capabilities is not None
+    assert capabilities["runtime_verified"] is True
+    assert capabilities["cuda_graph"] is True
+    assert capabilities["diffusion_compiled"] is True
+    assert capabilities["codec_compiled"] is True
+    assert capabilities["negative_qwen_compiled"] is True
+    assert capabilities["negative_cuda_graph"] is True
+    assert capabilities["negative_cuda_graph_configured_batch_sizes"] == [1, 2, 4, 8]
+    assert capabilities["negative_cuda_graph_captured_batch_sizes"] == [1]
+    assert capabilities["positive_attention_impl"] == ["FlashAttentionImpl"]
+    assert capabilities["negative_attention_impl"] == ["FlashAttentionImpl"]
 
 
 def test_models_without_handler_returns_empty_openai_list() -> None:

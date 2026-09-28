@@ -345,6 +345,23 @@ def test_stage_pool_is_distributed_falls_back_to_hub():
     assert AsyncOmniEngine._stage_pool_is_distributed(PoolWithoutIsDistributed()) is True
 
 
+def test_local_stage_pool_honors_least_queue_length_policy():
+    pool = StagePool(
+        0,
+        [_FakeStageClient(), _FakeStageClient()],
+        local_lb_policy="least-queue-length",
+    )
+
+    assert pool.select_replica_id("req-1") == 0
+    assert pool.select_replica_id("req-2") == 1
+    # Affinity is sticky while the request is active.
+    assert pool.select_replica_id("req-1") == 0
+    assert pool.select_replica_id("req-3") == 0
+    pool.release_binding("req-2")
+    # Replica 1 is now empty while replica 0 owns two requests.
+    assert pool.select_replica_id("req-4") == 1
+
+
 def test_build_add_request_message_releases_preselected_replica_on_preprocess_error(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)

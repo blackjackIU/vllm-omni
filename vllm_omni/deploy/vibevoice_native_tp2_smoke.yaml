@@ -1,0 +1,28 @@
+# TP=2 correctness smoke profile.  Both GPUs cooperate on one model replica;
+# this is intentionally not the two-independent-replica throughput profile.
+# Promote to vibevoice_native_tp2.yaml only after warmup, API and parity gates.
+base_config: vibevoice.yaml
+pipeline: vibevoice
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    num_replicas: 1
+    tensor_parallel_size: 2
+    max_num_seqs: 1
+    max_num_batched_tokens: 4096
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [1]
+      cudagraph_num_of_warmups: 1
+      cudagraph_copy_inputs: true
+    env:
+      VLLM_OMNI_VIBEVOICE_COMPILE_DIFFUSION: "1"
+      VLLM_OMNI_VIBEVOICE_COMPILE_CODEC: "1"
+      VLLM_OMNI_VIBEVOICE_COMPILE_NEGATIVE_QWEN: "1"
+      VLLM_OMNI_VIBEVOICE_GRAPH_NEGATIVE_QWEN: "0"
+      VLLM_OMNI_VIBEVOICE_NEGATIVE_GRAPH_BATCH_SIZES: "1"
+      VLLM_OMNI_VIBEVOICE_COMPILE_MODE: "default"
+      VLLM_OMNI_VIBEVOICE_PROFILE_BATCH_SIZE: "1"
+      VLLM_OMNI_VIBEVOICE_LOG_TOKEN_TRACE: "1"
+      VLLM_OMNI_VIBEVOICE_TOKEN_TRACE_LIMIT: "64"

@@ -1,0 +1,15 @@
+# Default aggregate-throughput profile: one full native replica per GPU.
+# Serve with --omni-lb-policy least-queue-length.
+base_config: vibevoice.yaml
+pipeline: vibevoice
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    num_replicas: 2
+    max_num_seqs: 8
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8]
+      cudagraph_num_of_warmups: 1
+      cudagraph_copy_inputs: true

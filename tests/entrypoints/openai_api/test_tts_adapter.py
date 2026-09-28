@@ -27,6 +27,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSNanoAdapter,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.vibevoice import VibeVoiceAdapter
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
@@ -54,6 +55,7 @@ EXPECTED_MODEL_TYPES = {
     "step_audio2",
     "indextts2",
     "indextts2_5",
+    "vibevoice",
 }
 
 
@@ -115,6 +117,81 @@ def test_moss_tts_applies_request_max_new_tokens(adapter_cls):
 def test_qwen3_tts_metadata():
     assert Qwen3TTSAdapter.backend == "ar"
     assert issubclass(Qwen3TTSAdapter, ARTTSAdapter)
+
+
+def _vibevoice_adapter_and_request(**overrides):
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _validate_ref_audio_format=lambda ref_audio: None,
+    )
+    request_values = {
+        "input": "Speaker 1: Hello.",
+        "voice": None,
+        "ref_audio": "file:///voice.wav",
+        "max_new_tokens": None,
+        "extra_params": None,
+    }
+    request_values.update(overrides)
+    request = SimpleNamespace(**request_values)
+    return VibeVoiceAdapter(SimpleNamespace(server=server)), request
+
+
+def test_vibevoice_adapter_metadata_and_detection():
+    assert VibeVoiceAdapter.backend == "ar"
+    assert detect_tts_model_type("vibevoice", "VibeVoiceForConditionalGeneration") == "vibevoice"
+    assert (
+        detect_tts_model_type(
+            "vibevoice_streaming",
+            "VibeVoiceStreamingForConditionalGeneration",
+        )
+        == "vibevoice"
+    )
+    assert (
+        detect_tts_model_type(
+            "vibevoice_legacy",
+            "LegacyVibeVoiceForConditionalGeneration",
+        )
+        == "vibevoice"
+    )
+
+
+def test_vibevoice_requires_one_reference_per_script_speaker():
+    adapter, request = _vibevoice_adapter_and_request(
+        input="Speaker 1: Hello.\nSpeaker 2: Hi.",
+    )
+
+    assert "one reference clip per speaker" in adapter.validate(request)
+
+
+def test_vibevoice_allows_unconditioned_generation_explicitly():
+    adapter, request = _vibevoice_adapter_and_request(
+        ref_audio=None,
+        extra_params={"disable_prefill": True},
+    )
+
+    assert adapter.validate(request) is None
+
+
+def test_vibevoice_accepts_seed_and_max_tokens_in_extra_params():
+    adapter, request = _vibevoice_adapter_and_request(
+        ref_audio=None,
+        extra_params={
+            "disable_prefill": True,
+            "seed": 42,
+            "max_new_tokens": 128,
+        },
+    )
+
+    assert adapter.validate(request) is None
+
+
+def test_vibevoice_rejects_non_contiguous_speaker_labels():
+    adapter, request = _vibevoice_adapter_and_request(
+        input="Speaker 1: Hello.\nSpeaker 3: Missing speaker two.",
+        ref_audio=["file:///voice-one.wav", "file:///voice-three.wav"],
+    )
+
+    assert "contiguous" in adapter.validate(request)
 
 
 def test_indextts_adapters_are_versioned():

@@ -128,6 +128,7 @@ class StageRuntime:
         async_chunk: bool,
         tokenizer: str | None = None,
         log_stats: bool = False,
+        omni_lb_policy: str = "round-robin",
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -137,6 +138,11 @@ class StageRuntime:
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         self._log_stats = log_stats
+        # Distributed pools replace this with coordinator-backed routing. In
+        # ordinary two-GPU local serving it must still honor the CLI policy;
+        # previously every local pool silently used round-robin.
+        _build_load_balancer_factory(omni_lb_policy)
+        self._omni_lb_policy = omni_lb_policy
         self._num_stages = len(stage_configs)
 
         # Populated by initialize()
@@ -726,6 +732,7 @@ class StageRuntime:
                     clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
+                    local_lb_policy=self._omni_lb_policy,
                 )
             )
 
@@ -775,6 +782,7 @@ class DistStageRuntime(StageRuntime):
             async_chunk=async_chunk,
             tokenizer=tokenizer,
             log_stats=log_stats,
+            omni_lb_policy=omni_lb_policy,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -1138,4 +1146,5 @@ def create_stage_runtime(
         async_chunk=async_chunk,
         tokenizer=tokenizer,
         log_stats=log_stats,
+        omni_lb_policy=omni_lb_policy,
     )

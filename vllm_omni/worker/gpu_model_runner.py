@@ -167,7 +167,15 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Initialize the wrapper for both multimodal output tensors
         # and for hidden states to be passed between stages
-        if self.cache_config.enable_prefix_caching:
+        # Some native AR models reconstruct all non-token prompt embeddings
+        # deterministically and only need vLLM's paged KV prefix cache. They do
+        # not need Omni's second hidden/multimodal tensor cache; creating it
+        # would retain per-step audio and also disable the runner's pinned
+        # asynchronous output-copy path.
+        disable_tensor_prefix_cache = bool(
+            getattr(getattr(self, "model", None), "disable_omni_tensor_prefix_cache", False)
+        )
+        if self.cache_config.enable_prefix_caching and not disable_tensor_prefix_cache:
             self.omni_prefix_cache = OmniTensorPrefixCache(
                 num_blocks=kv_cache_config.num_blocks,
                 block_size=self.cache_config.block_size,
@@ -261,6 +269,56 @@ class OmniGPUModelRunner(GPUModelRunner):
             pad_attn=pad_attn,
             for_cudagraph_capture=for_cudagraph_capture,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
+        )
+
+    def _maybe_apply_auxiliary_attention_streams(
+        self,
+        *,
+        attn_metadata: Any,
+        slot_mappings: Any,
+        input_ids: torch.Tensor | None,
+        request_token_spans: list[tuple[int, int]],
+    ) -> None:
+        """Install model-declared logical KV metadata before forward.
+
+        The hook is intentionally model-agnostic.  Models describe logical
+        sequence lengths/write positions; this runner owns backend metadata and
+        paged block-table translation.
+        """
+        build_specs = getattr(self.model, "build_auxiliary_attention_streams", None)
+        if not callable(build_specs) or input_ids is None or attn_metadata is None:
+            return
+        req_ids = list(self.input_batch.req_ids)[: len(request_token_spans)]
+        # Models with token-dependent auxiliary streams must not call .item()
+        # on the GPU input in the hot path. The scheduler already owns an
+        # authoritative CPU token table; expose only the scheduled slice.
+        for request_index, (request_id, (start, end)) in enumerate(
+            zip(req_ids, request_token_spans, strict=False)
+        ):
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[request_index])
+            scheduled = self.input_batch.token_ids_cpu[
+                request_index,
+                num_computed : num_computed + (end - start),
+            ].tolist()
+            self.model_intermediate_buffer.setdefault(request_id, {})[
+                "_omni_scheduled_token_ids_cpu"
+            ] = scheduled
+        specs = build_specs(
+            req_ids=req_ids,
+            input_ids=input_ids,
+            request_token_spans=request_token_spans,
+            model_intermediate_buffer=self.model_intermediate_buffer,
+        )
+        if not specs:
+            return
+        from vllm_omni.attention.auxiliary_stream import apply_auxiliary_attention_streams
+
+        apply_auxiliary_attention_streams(
+            attn_metadata=attn_metadata,
+            slot_mappings=slot_mappings if isinstance(slot_mappings, dict) else None,
+            specs=tuple(specs),
+            request_token_spans=request_token_spans,
+            block_size=int(self.cache_config.block_size),
         )
 
     def _build_model_sampler_output_token_ids(self) -> list[list[int]]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time as _time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -102,6 +103,7 @@ class StagePool:
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
+        local_lb_policy: str = "round-robin",
     ) -> None:
         if isinstance(clients, list):
             normalized_clients: list[StagePoolClient] = list(clients)
@@ -116,6 +118,9 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
+        if local_lb_policy not in {"random", "round-robin", "least-queue-length"}:
+            raise ValueError(f"unsupported local StagePool load-balancing policy: {local_lb_policy!r}")
+        self._local_lb_policy = local_lb_policy
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
@@ -573,6 +578,26 @@ class StagePool:
                 raise StageUnavailableError(f"stage {self.stage_id} has no live replicas")
             if len(live) == 1:
                 chosen = live[0]
+            elif self._local_lb_policy == "least-queue-length":
+                # Use both sticky in-flight admission and the client's output
+                # backlog. The former responds immediately to bursts while the
+                # latter prevents routing more work to a replica whose client
+                # is already slow to drain. Rotate exact ties so a burst does
+                # not consistently prefer GPU 0.
+                samples = {
+                    replica_id: self.replica_monitor_sample(replica_id)
+                    for replica_id in live
+                }
+                loads = {
+                    replica_id: (inflight, output_backlog)
+                    for replica_id, (output_backlog, inflight) in samples.items()
+                }
+                minimum = min(loads.values())
+                candidates = [replica_id for replica_id in live if loads[replica_id] == minimum]
+                chosen = candidates[self._next_replica_id % len(candidates)]
+                self._next_replica_id += 1
+            elif self._local_lb_policy == "random":
+                chosen = random.choice(live)
             else:
                 # Round-robin over live, available replicas only.
                 start = self._next_replica_id % len(live)

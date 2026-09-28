@@ -116,6 +116,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     omnivoice,
     qwen3_tts,
     step_audio2,
+    vibevoice,
     voxcpm2,
     voxtral,
 )

@@ -1,0 +1,2 @@
+# Backward-compatible name for the native streaming profile.
+base_config: vibevoice_native_streaming.yaml

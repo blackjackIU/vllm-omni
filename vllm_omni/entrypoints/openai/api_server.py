@@ -1000,8 +1000,21 @@ async def omni_init_app_state(
     # Upstream f5ffc59b6a moved warmup onto OnlineRenderer. Accelerator
     # images can temporarily lag that renderer API, where warmup is optional.
     renderer_warmup = getattr(state.online_renderer, "warmup", None)
-    if renderer_warmup is not None:
+    vibevoice_stage_keys = {
+        getattr(getattr(stage, "engine_args", None), "model_stage", None)
+        for stage in (state.stage_configs or [])
+    }
+    is_legacy_vibevoice = "vibevoice_legacy" in vibevoice_stage_keys
+    # Only the explicit reference backend has the historical one-token
+    # placeholder scheduler. Native VibeVoice exposes its real Qwen prompt and
+    # must pass the same renderer warmup as other native AR models.
+    if renderer_warmup is not None and not is_legacy_vibevoice:
         renderer_warmup()
+    elif renderer_warmup is not None:
+        logger.warning(
+            "Skipping chat renderer warmup for the VibeVoice legacy reference "
+            "backend; this backend is not continuous-batched"
+        )
 
     state.openai_serving_completion = (
         OpenAIServingCompletion(
@@ -1138,6 +1151,12 @@ async def omni_init_app_state(
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
     await state.openai_serving_speech.warmup()
+    vibevoice_capabilities = await _verified_vibevoice_capabilities(state)
+    if vibevoice_capabilities is not None:
+        logger.info(
+            "VIBEVOICE_DEPLOYMENT_CAPABILITIES_AFTER_WARMUP %s",
+            json.dumps(vibevoice_capabilities, sort_keys=True),
+        )
 
     state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
@@ -1765,6 +1784,160 @@ async def duplex_websocket(websocket: WebSocket):
 _remove_route_from_router(router, "/health")
 
 
+def _config_value(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _vibevoice_deployment_capabilities(state: Any) -> dict[str, Any] | None:
+    """Return observable VibeVoice deployment properties from resolved config.
+
+    The concrete paged-attention kernel is deliberately not guessed here. The
+    worker emits ``VIBEVOICE_CAPABILITIES`` after model load/warmup with the
+    instantiated positive/negative attention implementation names.
+    """
+    stages = list(getattr(state, "stage_configs", None) or [])
+    matching: list[tuple[Any, Any, str]] = []
+    for stage in stages:
+        engine_args = _config_value(stage, "engine_args", {})
+        stage_key = str(_config_value(engine_args, "model_stage", ""))
+        if stage_key in {"vibevoice", "vibevoice_streaming", "vibevoice_legacy"}:
+            matching.append((stage, engine_args, stage_key))
+    if not matching:
+        return None
+
+    is_legacy = any(stage_key == "vibevoice_legacy" for _, _, stage_key in matching)
+    _, engine_args, _ = matching[0]
+    parallel = _config_value(engine_args, "parallel_config", {})
+    compilation = _config_value(engine_args, "compilation_config", {})
+    cudagraph_mode = str(_config_value(compilation, "cudagraph_mode", "NONE"))
+    replicas = sum(
+        int(_config_value(_config_value(item, "runtime", {}), "num_replicas", 1) or 1)
+        for item, _, _ in matching
+    )
+    tensor_parallel_size = int(
+        _config_value(
+            parallel,
+            "tensor_parallel_size",
+            _config_value(engine_args, "tensor_parallel_size", 1),
+        )
+        or 1
+    )
+    result = {
+        "backend": "vibevoice_legacy_reference" if is_legacy else "vibevoice_native",
+        "attention": "huggingface_dynamic_cache" if is_legacy else "vllm_paged_attention",
+        "cfg_kv_streams": 0 if is_legacy else 2,
+        "continuous_batching": not is_legacy,
+        "chunked_prefill": bool(_config_value(engine_args, "enable_chunked_prefill", False)),
+        "prefix_caching": bool(_config_value(engine_args, "enable_prefix_caching", False)),
+        # Configuration is not proof that capture completed. The dedicated
+        # capabilities endpoint replaces ``cuda_graph`` with the worker's
+        # post-warmup observation when collective RPC is available.
+        "cuda_graph": None if not is_legacy else False,
+        "cuda_graph_configured": (not is_legacy and "NONE" not in cudagraph_mode.upper()),
+        "runtime_verified": is_legacy,
+        "replicas": replicas,
+        "tensor_parallel_size": tensor_parallel_size,
+        "worker_runtime_report": "VIBEVOICE_CAPABILITIES",
+    }
+    if is_legacy:
+        # The reference backend is served in-process and has no native worker
+        # kernel report to collect. Its deliberately limited capability set is
+        # therefore already fully verified.
+        result["runtime_report_count"] = 1
+        result["all_replicas_reported"] = True
+    return result
+
+
+def _flatten_vibevoice_runtime_reports(value: Any) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        if value.get("supported") and value.get("backend") == "vibevoice_native":
+            reports.append(value)
+        else:
+            for nested in value.values():
+                reports.extend(_flatten_vibevoice_runtime_reports(nested))
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            reports.extend(_flatten_vibevoice_runtime_reports(nested))
+    return reports
+
+
+async def _verified_vibevoice_capabilities(state: Any) -> dict[str, Any] | None:
+    configured = _vibevoice_deployment_capabilities(state)
+    if configured is None or configured["backend"] != "vibevoice_native":
+        return configured
+    engine_client = getattr(state, "engine_client", None)
+    collective_rpc = getattr(engine_client, "collective_rpc", None)
+    if not callable(collective_rpc):
+        return configured
+    try:
+        raw_reports = await collective_rpc(
+            method="get_model_runtime_capabilities",
+            timeout=10.0,
+        )
+    except Exception as exc:
+        logger.warning("Unable to query VibeVoice worker capabilities: %s", exc)
+        return configured
+    reports = _flatten_vibevoice_runtime_reports(raw_reports)
+    if not reports:
+        return configured
+
+    expected_replicas = int(configured.get("replicas", 1) or 1)
+    all_replicas_reported = len(reports) >= expected_replicas
+    configured["runtime_verified"] = all_replicas_reported
+    configured["runtime_report_count"] = len(reports)
+    configured["all_replicas_reported"] = all_replicas_reported
+    configured["runtime_reports"] = reports
+    configured["cuda_graph"] = all_replicas_reported and all(
+        bool(report.get("cuda_graph_captured")) for report in reports
+    )
+    configured["diffusion_compiled"] = all_replicas_reported and all(
+        bool(report.get("diffusion_compiled")) for report in reports
+    )
+    configured["codec_compiled"] = all_replicas_reported and all(
+        bool(report.get("codec_compiled")) for report in reports
+    )
+    configured["negative_qwen_compiled"] = all_replicas_reported and all(
+        bool(report.get("negative_qwen_compiled")) for report in reports
+    )
+    configured["negative_cuda_graph"] = all_replicas_reported and all(
+        bool(report.get("negative_cuda_graph")) for report in reports
+    )
+    configured["negative_cuda_graph_configured_batch_sizes"] = sorted(
+        {
+            int(size)
+            for report in reports
+            for size in report.get("negative_cuda_graph_configured_batch_sizes", [])
+        }
+    )
+    configured["negative_cuda_graph_captured_batch_sizes"] = sorted(
+        {
+            int(size)
+            for report in reports
+            for size in report.get("negative_cuda_graph_batch_sizes", [])
+        }
+    )
+    configured["positive_attention_impl"] = sorted(
+        {
+            implementation
+            for report in reports
+            for implementation in report.get("positive_attention_impl", [])
+        }
+    )
+    configured["negative_attention_impl"] = sorted(
+        {
+            implementation
+            for report in reports
+            for implementation in report.get("negative_attention_impl", [])
+        }
+    )
+    return configured
+
+
 @router.get("/health")
 async def health(raw_request: Request) -> JSONResponse:
     """Health check endpoint that works for both LLM and diffusion modes.
@@ -1783,12 +1956,30 @@ async def health(raw_request: Request) -> JSONResponse:
 
     try:
         await engine_client.check_health()
-        return JSONResponse(content={"status": "healthy"})
+        content: dict[str, Any] = {"status": "healthy"}
+        capabilities = _vibevoice_deployment_capabilities(raw_request.app.state)
+        if capabilities is not None:
+            content["capabilities"] = capabilities
+        return JSONResponse(content=content)
     except EngineDeadError:
         return JSONResponse(
             content={"status": "unhealthy"},
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
         )
+
+
+@router.get("/v1/audio/capabilities")
+async def audio_capabilities(raw_request: Request) -> JSONResponse:
+    """Describe the resolved speech execution path without claiming a kernel
+    solely because an environment flag was set.
+    """
+    capabilities = await _verified_vibevoice_capabilities(raw_request.app.state)
+    if capabilities is None:
+        return JSONResponse(
+            content={"error": "VibeVoice is not the active speech backend"},
+            status_code=HTTPStatus.NOT_FOUND.value,
+        )
+    return JSONResponse(content=capabilities)
 
 
 # Remove existing models endpoint if present (from vllm imports)

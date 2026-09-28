@@ -23,6 +23,7 @@ For the full list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
+| VibeVoice 1.5B | `microsoft/VibeVoice-1.5B` | ✓ (1-4 reference clips) | ✓ (streaming profile) | uploaded audio voice for one speaker | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 | SoulX-Singer | `Soul-AILab/SoulX-Singer` | ✓ (prompt audio) | — (batch only) | — (prompt + target audio) | — (chat client) |
@@ -97,6 +98,240 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## VibeVoice 1.5B
+
+VibeVoice combines a Qwen2.5-1.5B backbone, next-token diffusion, and a
+24 kHz acoustic decoder. The default profile uses the native vLLM Qwen2
+backbone, two paged-KV streams for positive/negative CFG, continuous batching,
+chunked prefill, prefix caching, and piecewise CUDA graphs. The community
+generation loop is isolated in the legacy reference profile.
+
+Create the environment and download the weights:
+
+```bash
+cd /data/hungnp36/vllm-omni/vllm-omni
+deactivate 2>/dev/null || true
+python3 -m venv /data/venvs/vllm-omni
+source /data/venvs/vllm-omni/bin/activate
+python -m pip install -U pip setuptools wheel uv huggingface_hub
+UV_LINK_MODE=copy VLLM_OMNI_TARGET_DEVICE=cuda uv pip install -e .
+
+unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
+export HF_HOME=/data/models/.hf-cache
+hf download microsoft/VibeVoice-1.5B --local-dir /data/models/VibeVoice-1.5B
+hf download Qwen/Qwen2.5-1.5B --local-dir /data/models/Qwen2.5-1.5B
+
+PYTHONPATH="$PWD" python3 \
+  examples/online_serving/text_to_speech/validate_vibevoice_checkpoint.py \
+  /data/models/VibeVoice-1.5B
+```
+
+The native profile uses the inference-only codec and parity scheduler vendored
+in vLLM-Omni; it does not require the community Git package. Install that
+package only when running `vibevoice_legacy_reference.yaml` for A/B comparison:
+
+```bash
+uv pip install --no-deps \
+  'git+https://github.com/vibevoice-community/VibeVoice.git@631804b9c1f042e381207fe87c54603fe6accbc1'
+```
+
+Native and reference deploy profiles are provided:
+
+- `vibevoice_native_2gpu_throughput.yaml`: two complete native replicas.
+- `vibevoice_native_latency.yaml`: small graph/batch buckets for low concurrency.
+- `vibevoice_native_streaming.yaml`: native per-step PCM output.
+- `vibevoice_legacy_reference.yaml`: HF `generate()` reference/rollback only.
+- `vibevoice_native_tp2.yaml`: conditional TP=2 benchmark profile.
+- `vibevoice_native_tp2_smoke.yaml`: one-sequence TP=2 correctness gate.
+
+`vibevoice.yaml`, `vibevoice_2gpu.yaml`, and `vibevoice_streaming.yaml` remain
+backward-compatible names for the corresponding native profiles.
+
+Before moving the source to the GPU server, run the focused contract tests in
+an environment with the project development dependencies installed:
+
+```bash
+python3 -m pytest -q \
+  tests/model_executor/models/vibevoice \
+  tests/entrypoints/openai_api/test_tts_adapter.py \
+  tests/entrypoints/openai_api/test_api_server_guards.py \
+  tests/engine/test_async_omni_engine_input.py
+```
+
+Kill an old server and start the two-GPU throughput profile:
+
+```bash
+fuser -k 8091/tcp 2>/dev/null || true
+source /data/venvs/vllm-omni/bin/activate
+cd /data/hungnp36/vllm-omni/vllm-omni
+export HF_HOME=/data/models/.hf-cache
+
+VLLM_USE_DEEP_GEMM=0 VLLM_USE_FLASHINFER_SAMPLER=0 \
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH="$PWD" \
+python3 -m vllm_omni.entrypoints.cli.main serve \
+  /data/models/VibeVoice-1.5B \
+  --served-model-name microsoft/VibeVoice-1.5B \
+  --tokenizer /data/models/Qwen2.5-1.5B \
+  --omni \
+  --deploy-config "$PWD/vllm_omni/deploy/vibevoice_native_2gpu_throughput.yaml" \
+  --omni-lb-policy least-queue-length \
+  --host 0.0.0.0 --port 8091
+```
+
+After weights load, look for the machine-readable `VIBEVOICE_CAPABILITIES`,
+`VIBEVOICE_CAPABILITIES_AFTER_CAPTURE`, and final
+`VIBEVOICE_DEPLOYMENT_CAPABILITIES_AFTER_WARMUP` lines. They report the attention
+implementation objects actually constructed, KV dtype/block size,
+prefix/chunked-prefill state, completed graph capture, TP size, and
+`hf_generate=false`. Standard vLLM `/metrics` exposes scheduler/KV/prefix-cache
+metrics; native VibeVoice adds `vllm_omni_vibevoice_*` CFG/codec/cache metrics.
+The resolved deployment contract is also available over HTTP. The dedicated
+capabilities route queries every worker replica and only sets `cuda_graph=true`
+after every configured replica reports completed capture. It also exposes
+`runtime_report_count`, `all_replicas_reported`, `diffusion_compiled`, and
+`codec_compiled`. The negative CFG report distinguishes configured graph
+buckets from buckets actually captured by live traffic:
+`negative_cuda_graph_configured_batch_sizes` and
+`negative_cuda_graph_captured_batch_sizes`. `/health` keeps the cheaper
+configuration view and exposes `cuda_graph_configured` separately:
+
+```bash
+curl -s http://127.0.0.1:8091/v1/audio/capabilities | python3 -m json.tool
+curl -s http://127.0.0.1:8091/health | python3 -m json.tool
+curl -s http://127.0.0.1:8091/metrics | grep -E 'vibevoice|prefix_cache|kv_cache|cudagraph'
+```
+
+Use the bundled concurrent benchmark after warm-up:
+
+```bash
+python3 examples/online_serving/text_to_speech/benchmark_vibevoice.py \
+  --requests 8 --concurrency 4 --json-output native-1gpu.json
+
+# Confirm the compact CFG batch-4 graph was reached after concurrent traffic.
+curl -s http://127.0.0.1:8091/v1/audio/capabilities | python3 -m json.tool
+curl -s http://127.0.0.1:8091/metrics | \
+  grep vllm_omni_vibevoice_negative_cuda_graph_total
+
+# With voice cloning:
+python3 examples/online_serving/text_to_speech/benchmark_vibevoice.py \
+  --ref-audio file:///absolute/path/to/reference.wav \
+  --requests 8 --concurrency 4
+```
+
+It reports mean/p50/p95 latency, requests per second, and aggregate real-time
+factor. Keep the text, seed, DDPM steps, and concurrency fixed when comparing
+profiles. If a GPU runs out of memory on long scripts, lower `max_num_seqs`
+from 8 to 4 or 2 in the selected deploy YAML.
+
+To make a release gate fail automatically, first save the legacy result and
+then compare the native run against it:
+
+```bash
+python3 examples/online_serving/text_to_speech/benchmark_vibevoice.py \
+  --url http://127.0.0.1:8091/v1/audio/speech \
+  --requests 8 --concurrency 4 --json-output legacy.json
+python3 examples/online_serving/text_to_speech/benchmark_vibevoice.py \
+  --url http://127.0.0.1:8091/v1/audio/speech \
+  --requests 8 --concurrency 4 --baseline-json legacy.json \
+  --min-speedup 1.5 --json-output native.json
+```
+
+For the concurrency-1 latency gate, produce matching baseline/native JSON
+files with `--concurrency 1`, then pass
+`--baseline-json legacy-c1.json --max-latency-ratio 1.10` on the native run.
+For the two-replica scale gate, use the one-GPU native result as the baseline,
+run the two-GPU profile at sufficient concurrency, and require
+`--baseline-json native-1gpu.json --min-speedup 1.8`.
+
+To benchmark one model sharded across both GPUs instead, serve
+`vibevoice_native_tp2.yaml`. This is TP=2 (`num_replicas=1`), not two copies:
+
+```bash
+fuser -k 8091/tcp 2>/dev/null || true
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH="$PWD" \
+python3 -m vllm_omni.entrypoints.cli.main serve \
+  /data/models/VibeVoice-1.5B \
+  --served-model-name microsoft/VibeVoice-1.5B \
+  --tokenizer /data/models/Qwen2.5-1.5B \
+  --omni \
+  --deploy-config "$PWD/vllm_omni/deploy/vibevoice_native_tp2.yaml" \
+  --stage-init-timeout 1800 --init-timeout 1800 \
+  --host 0.0.0.0 --port 8091
+
+python3 examples/online_serving/text_to_speech/benchmark_vibevoice.py \
+  --requests 8 --concurrency 4 --json-output native-tp2.json
+```
+
+TP=2 should only be promoted when its measured throughput exceeds two local
+replicas. Systems without direct GPU P2P will generally pay an NCCL all-reduce
+cost at every Qwen layer, which can make TP=2 slower for this 1.5B model.
+
+For numerical WAV parity, run legacy on port 8092 and native on port 8091:
+
+```bash
+python3 examples/online_serving/text_to_speech/compare_vibevoice_audio.py \
+  --legacy-url http://127.0.0.1:8092/v1/audio/speech \
+  --native-url http://127.0.0.1:8091/v1/audio/speech --seed 42
+```
+
+Single-speaker voice cloning:
+
+```bash
+curl http://localhost:8091/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "microsoft/VibeVoice-1.5B",
+    "input": "This is a VibeVoice synthesis test.",
+    "ref_audio": "file:///path/to/reference.wav",
+    "response_format": "wav",
+    "extra_params": {"cfg_scale": 1.3, "ddpm_steps": 10}
+  }' --output vibevoice.wav
+```
+
+No-reference smoke test:
+
+```bash
+curl http://localhost:8091/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "microsoft/VibeVoice-1.5B",
+    "input": "This is a native VibeVoice smoke test.",
+    "response_format": "wav",
+    "seed": 42,
+    "extra_params": {
+      "disable_prefill": true,
+      "cfg_scale": 1.3,
+      "ddpm_steps": 10
+    }
+  }' --output /data/vibevoice-test.wav
+```
+
+For a multi-speaker script, label each line with `Speaker N:` and pass the
+reference clips in the same speaker order:
+
+```json
+{
+  "input": "Speaker 1: Welcome to the show.\nSpeaker 2: Thanks for having me.",
+  "ref_audio": [
+    "file:///path/to/speaker-1.wav",
+    "file:///path/to/speaker-2.wav"
+  ]
+}
+```
+
+Set `extra_params.disable_prefill=true` to smoke-test without voice cloning.
+The voice is then generated without speaker conditioning; VibeVoice 1.5B does
+not ship named built-in voices. Supported model-specific controls are
+`cfg_scale` (1-5), `ddpm_steps` (1-100), `max_length_times` (1-10), `seed`,
+and `max_new_tokens`; `seed` and `max_new_tokens` can be top-level or inside
+`extra_params`.
+
+Non-streaming requests concatenate native delta chunks without an HF daemon.
+To receive chunks as soon as they are decoded, select `vibevoice_native_streaming.yaml`
+and request `stream=true`, `stream_format="audio"`, `response_format="pcm"`.
 
 ---
 

@@ -319,6 +319,42 @@ _OMNI_MODELS = {
         "voxtral_tts",
         "VoxtralTTSForConditionalGeneration",
     ),
+    ## VibeVoice 1.5B — native AR runtime + explicit reference fallback
+    "VibeVoiceForConditionalGeneration": (
+        "vibevoice",
+        "modeling_vibevoice",
+        "VibeVoiceForConditionalGeneration",
+    ),
+    "VibeVoiceStreamingForConditionalGeneration": (
+        "vibevoice",
+        "modeling_vibevoice",
+        "VibeVoiceStreamingForConditionalGeneration",
+    ),
+    "VibeVoiceNativeForConditionalGeneration": (
+        "vibevoice",
+        "modeling_vibevoice_native",
+        "VibeVoiceNativeForConditionalGeneration",
+    ),
+    "VibeVoiceForConditionalGenerationInference": (
+        "vibevoice",
+        "modeling_vibevoice_native",
+        "VibeVoiceNativeForConditionalGeneration",
+    ),
+    "VibeVoiceStreamingForConditionalGenerationInference": (
+        "vibevoice",
+        "modeling_vibevoice_native",
+        "VibeVoiceNativeForConditionalGeneration",
+    ),
+    "LegacyVibeVoiceForConditionalGeneration": (
+        "vibevoice",
+        "modeling_vibevoice",
+        "LegacyVibeVoiceForConditionalGeneration",
+    ),
+    "LegacyVibeVoiceStreamingForConditionalGeneration": (
+        "vibevoice",
+        "modeling_vibevoice",
+        "LegacyVibeVoiceStreamingForConditionalGeneration",
+    ),
     "VoxtralTTSAudioGeneration": (
         "voxtral_tts",
         "voxtral_tts_audio_generation",

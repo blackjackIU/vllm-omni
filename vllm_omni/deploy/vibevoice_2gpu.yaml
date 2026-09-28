@@ -1,0 +1,2 @@
+# Backward-compatible name for the native two-replica throughput profile.
+base_config: vibevoice_native_2gpu_throughput.yaml

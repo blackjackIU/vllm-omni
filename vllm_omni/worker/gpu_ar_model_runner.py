@@ -482,6 +482,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def capture_model(self) -> int:
         result = super().capture_model()
         self._capture_talker_mtp_graphs()
+        capture_complete = getattr(self.model, "on_cuda_graph_capture_complete", None)
+        if callable(capture_complete):
+            capture_complete()
         return result
 
     def shutdown(self) -> None:
@@ -995,6 +998,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            observe_scheduler_step = getattr(self.model, "observe_scheduler_step", None)
+            if callable(observe_scheduler_step):
+                observe_scheduler_step(scheduler_output)
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
 
@@ -1178,6 +1184,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
 
+            self._maybe_apply_auxiliary_attention_streams(
+                attn_metadata=attn_metadata,
+                slot_mappings=slot_mappings,
+                input_ids=input_ids,
+                request_token_spans=self._compute_request_token_spans(num_scheduled_tokens_np),
+            )
+
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
         prepare_runner_inputs = getattr(self.model, "prepare_runner_inputs", None)
@@ -1233,6 +1246,28 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     defer_finalize=defer_kv_connector_finalize,
                 ) as kv_connector_output,
             ):
+                # Token-dependent Omni side paths must execute outside the
+                # model CUDA Graph replay. Putting this work in model.forward
+                # runs it during capture only; subsequent graph replays skip
+                # the Python branch entirely. The hook remains inside the
+                # forward/attention context so auxiliary paged-attention
+                # streams can use the metadata installed above.
+                prepare_omni_forward_inputs = getattr(
+                    self.model, "prepare_omni_forward_inputs", None
+                )
+                if callable(prepare_omni_forward_inputs):
+                    prepared_inputs_embeds = prepare_omni_forward_inputs(
+                        input_ids=input_ids,
+                        inputs_embeds=inputs_embeds,
+                        request_token_spans=self._compute_request_token_spans(
+                            num_scheduled_tokens_np
+                        ),
+                        model_intermediate_buffer=(
+                            self._gather_runtime_additional_information()
+                        ),
+                    )
+                    if prepared_inputs_embeds is not None:
+                        inputs_embeds = prepared_inputs_embeds
                 model_output = self._model_forward(
                     input_ids=input_ids,
                     positions=positions,

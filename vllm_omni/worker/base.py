@@ -45,6 +45,26 @@ class OmniGPUWorkerBase(GPUWorker):
             gc.collect()
             return res
 
+    def get_model_runtime_capabilities(self) -> dict[str, object]:
+        """Return capabilities measured by the instantiated model runner.
+
+        This method intentionally lives on the worker so the existing vLLM
+        collective-RPC path can query every physical replica.  Serving code
+        must not infer kernel/graph activation solely from YAML flags.
+        """
+        model = getattr(getattr(self, "model_runner", None), "model", None)
+        capability_fn = getattr(model, "runtime_capabilities", None)
+        if not callable(capability_fn):
+            return {
+                "supported": False,
+                "worker_rank": int(getattr(self, "rank", 0)),
+                "reason": "loaded model does not publish runtime_capabilities",
+            }
+        result = dict(capability_fn())
+        result["supported"] = True
+        result["worker_rank"] = int(getattr(self, "rank", 0))
+        return result
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -118,6 +138,19 @@ class OmniGPUWorkerBase(GPUWorker):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            # Composite native models can have substantial GPU-only side paths
+            # which the ordinary token dummy run never reaches. Run their
+            # explicit profiler before assigning the remaining memory to KV
+            # blocks; otherwise codec state and compiled diffusion workspaces
+            # first appear on the first real request and can cause an avoidable
+            # OOM despite a successful engine startup.
+            profile_side_modules = getattr(
+                getattr(self.model_runner, "model", None),
+                "profile_side_modules",
+                None,
+            )
+            if callable(profile_side_modules):
+                profile_side_modules()
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase

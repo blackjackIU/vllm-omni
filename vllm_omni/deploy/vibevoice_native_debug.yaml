@@ -1,0 +1,20 @@
+# Native VibeVoice correctness/debug profile.
+# Keep vLLM PagedAttention and the synchronous AR scheduler, but remove graph
+# replay and side-module torch.compile so CUDA failures are reported at their
+# originating eager operation. This profile is not intended for benchmarks.
+base_config: vibevoice.yaml
+pipeline: vibevoice
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    max_num_batched_tokens: 4096
+    enforce_eager: true
+    async_scheduling: false
+    env:
+      VLLM_OMNI_VIBEVOICE_COMPILE_DIFFUSION: "0"
+      VLLM_OMNI_VIBEVOICE_COMPILE_CODEC: "0"
+      VLLM_OMNI_VIBEVOICE_PROFILE_BATCH_SIZE: "1"
+      VLLM_OMNI_VIBEVOICE_LOG_TOKEN_TRACE: "1"
+      VLLM_OMNI_VIBEVOICE_TOKEN_TRACE_LIMIT: "64"
