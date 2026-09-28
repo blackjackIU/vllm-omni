@@ -2,7 +2,6 @@ from io import BytesIO
 
 import numpy as np
 import torch
-import torchaudio
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.protocol.audio import DEFAULT_AUDIO_FORMAT, AudioResponse, CreateAudio
@@ -80,6 +79,11 @@ class AudioMixin:
             return audio_tensor, sample_rate
 
         try:
+            # Keep the base speech API importable when torchaudio is absent or
+            # was built for a different CUDA runtime. The common speed=1 path
+            # does not need it at all.
+            import torchaudio
+
             if not np.issubdtype(audio_tensor.dtype, np.floating):
                 audio_tensor = audio_tensor.astype(np.float32)
 

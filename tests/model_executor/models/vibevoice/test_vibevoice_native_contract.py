@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,9 +21,6 @@ from vllm_omni.model_executor.models.vibevoice.checkpoint import (
     _language_model_keys,
     _prediction_head_keys,
     validate_vibevoice_checkpoint,
-)
-from vllm_omni.model_executor.models.vibevoice.vendored_dpm_solver import (
-    DPMSolverMultistepScheduler,
 )
 from vllm_omni.model_executor.models.vibevoice.modeling_vibevoice_native import (
     _native_checkpoint_target_name,
@@ -42,6 +40,10 @@ from vllm_omni.model_executor.models.vibevoice.prompting import (
     build_prompt_token_ids,
     parse_script,
     reference_frame_count,
+    resample_waveform,
+)
+from vllm_omni.model_executor.models.vibevoice.vendored_dpm_solver import (
+    DPMSolverMultistepScheduler,
 )
 from vllm_omni.model_executor.models.vibevoice.vendored_tokenizer import SConvTranspose1d
 
@@ -70,6 +72,18 @@ class _Tokenizer:
         return [100 + (ord(char) % 17) for char in text]
 
 
+def test_reference_resample_falls_back_when_torchaudio_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torchaudio", None)
+    waveform = torch.linspace(-1.0, 1.0, 8000)
+
+    resampled = resample_waveform(waveform, 8000, 24000)
+
+    assert resampled.shape == (24000,)
+    assert torch.isfinite(resampled).all()
+
+
 def test_negative_cuda_graph_fails_closed_for_tensor_parallel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -86,6 +100,73 @@ def test_negative_cuda_graph_fails_closed_for_tensor_parallel(
     assert runner.graph_disabled_reason == (
         "manual_negative_graph_unsupported_with_tensor_parallel"
     )
+
+
+def test_negative_cuda_graph_fails_closed_on_pre_ampere_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_OMNI_VIBEVOICE_GRAPH_NEGATIVE_QWEN", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+
+    runner = NegativeCFGGraphRunner(
+        torch.nn.Identity(),
+        layer_marker="negative_language_model",
+    )
+
+    assert runner.graph_enabled is False
+    assert runner.device_capability == (7, 5)
+    assert runner.graph_disabled_reason == (
+        "manual_negative_graph_requires_compute_capability_80"
+    )
+
+
+def test_negative_cuda_graph_fails_closed_with_triton_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TritonAttentionImpl:
+        pass
+
+    model = torch.nn.Sequential(torch.nn.Identity())
+    model[0].impl = TritonAttentionImpl()
+    monkeypatch.setenv("VLLM_OMNI_VIBEVOICE_GRAPH_NEGATIVE_QWEN", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+
+    runner = NegativeCFGGraphRunner(
+        model,
+        layer_marker="negative_language_model",
+    )
+
+    assert runner.graph_enabled is False
+    assert runner.graph_disabled_reason == (
+        "manual_negative_graph_unsupported_with_triton_attention"
+    )
+
+
+def test_negative_cuda_graph_remains_available_on_validated_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FlashAttentionImpl:
+        pass
+
+    model = torch.nn.Sequential(torch.nn.Identity())
+    model[0].impl = FlashAttentionImpl()
+    monkeypatch.setenv("VLLM_OMNI_VIBEVOICE_GRAPH_NEGATIVE_QWEN", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+
+    runner = NegativeCFGGraphRunner(
+        model,
+        layer_marker="negative_language_model",
+    )
+
+    assert runner.graph_enabled is True
+    assert runner.graph_disabled_reason is None
+    assert runner.device_capability == (9, 0)
 
 
 def test_diffusion_schedule_stays_on_cpu_inside_accelerator_default_context() -> None:

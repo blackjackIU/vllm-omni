@@ -1882,6 +1882,29 @@ class TestQwen3TTSPipeline:
             "top_p": 1.0,
         }
 
+    def test_env_deep_merge_preserves_base_runtime_safety_keys(self):
+        base = {
+            "stage_id": 0,
+            "env": {
+                "VLLM_OMNI_VIBEVOICE_COMPILE_MODE": "default",
+                "VLLM_OMNI_VIBEVOICE_COMPILE_CODEC": "1",
+            },
+        }
+        overlay = {
+            "stage_id": 0,
+            "env": {
+                "VLLM_OMNI_VIBEVOICE_GRAPH_NEGATIVE_QWEN": "0",
+            },
+        }
+
+        merged = _deep_merge_stage(base, overlay)
+
+        assert merged["env"] == {
+            "VLLM_OMNI_VIBEVOICE_COMPILE_MODE": "default",
+            "VLLM_OMNI_VIBEVOICE_COMPILE_CODEC": "1",
+            "VLLM_OMNI_VIBEVOICE_GRAPH_NEGATIVE_QWEN": "0",
+        }
+
 
 class TestMingFlashOmniPipeline:
     def test_registered(self):

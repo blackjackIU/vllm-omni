@@ -5,7 +5,6 @@
 
 import numpy as np
 import torch
-from torchaudio.functional import melscale_fbanks
 
 from vllm_omni.metrics import definitions as _metric_defs
 from vllm_omni.outputs import OmniRequestOutput
@@ -33,6 +32,16 @@ def mel_filter_bank(
     Returns:
         Tensor of shape ``(n_mels, n_fft // 2 + 1)``.
     """
+    try:
+        # Import lazily so models that do not need a mel frontend can still be
+        # served when torchaudio is unavailable or CUDA-incompatible.
+        from torchaudio.functional import melscale_fbanks
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            "mel_filter_bank requires a torchaudio build compatible with the "
+            "installed PyTorch runtime"
+        ) from exc
+
     if fmax is None:
         fmax = float(sr) / 2.0
     # Use mel_scale='slaney' and norm='slaney' to match librosa's

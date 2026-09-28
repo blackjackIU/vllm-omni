@@ -210,6 +210,67 @@ class _CapturedNegativeGraph:
     attention_metadata: dict[str, Any]
 
 
+def _attention_implementation_names(model: nn.Module) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                type(impl).__name__
+                for module in model.modules()
+                if (impl := getattr(module, "impl", None)) is not None
+            }
+        )
+    )
+
+
+def _manual_graph_compatibility(
+    model: nn.Module,
+    tensor_parallel_size: int,
+) -> tuple[str | None, tuple[int, int] | None, tuple[str, ...]]:
+    """Return a fail-closed compatibility decision for the manual CUDA graph.
+
+    The auxiliary graph is an optimization only; the compiled/eager path is
+    always correct. Be conservative on devices and attention backends where
+    graph replay has not been validated, because an asynchronous illegal
+    memory access poisons the whole serving process and cannot be recovered by
+    the ordinary graph-capture exception fallback.
+    """
+    attention_implementations = _attention_implementation_names(model)
+    if tensor_parallel_size > 1:
+        return (
+            "manual_negative_graph_unsupported_with_tensor_parallel",
+            None,
+            attention_implementations,
+        )
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None):
+        return (
+            "manual_negative_graph_requires_nvidia_cuda",
+            None,
+            attention_implementations,
+        )
+    try:
+        raw_capability = torch.cuda.get_device_capability()
+        capability = (int(raw_capability[0]), int(raw_capability[1]))
+    except Exception:
+        return (
+            "manual_negative_graph_device_capability_unavailable",
+            None,
+            attention_implementations,
+        )
+    if capability[0] < 8:
+        return (
+            "manual_negative_graph_requires_compute_capability_80",
+            capability,
+            attention_implementations,
+        )
+    if "TritonAttentionImpl" in attention_implementations:
+        return (
+            "manual_negative_graph_unsupported_with_triton_attention",
+            capability,
+            attention_implementations,
+        )
+    return None, capability, attention_implementations
+
+
 class NegativeCFGGraphRunner:
     """Compile and optionally graph the compact negative-CFG Qwen batch."""
 
@@ -231,20 +292,29 @@ class NegativeCFGGraphRunner:
         self.graph_requested = _enabled(
             "VLLM_OMNI_VIBEVOICE_GRAPH_NEGATIVE_QWEN", default="0"
         )
-        # The auxiliary branch owns a manual torch.cuda.CUDAGraph.  Under TP,
-        # Qwen's row-parallel layers also enqueue NCCL collectives. Capturing
-        # one independent graph per rank is not safe unless capture/replay is
-        # coordinated by vLLM's distributed graph runner. The previous manual
-        # path corrupted CUDA state on the second replay. Keep torch.compile
-        # enabled, but fail closed for manual graphs whenever TP > 1.
-        self.graph_enabled = self.graph_requested and self.tensor_parallel_size == 1
-        self.graph_disabled_reason: str | None = None
+        # The auxiliary branch owns a manual torch.cuda.CUDAGraph. Keep the
+        # compiled/eager optimization available everywhere, but enable manual
+        # replay only on configurations where it has been validated.
+        if self.graph_requested:
+            (
+                self.graph_disabled_reason,
+                self.device_capability,
+                self.attention_implementations,
+            ) = _manual_graph_compatibility(self.model, self.tensor_parallel_size)
+        else:
+            self.graph_disabled_reason = None
+            self.device_capability = None
+            self.attention_implementations = _attention_implementation_names(self.model)
+        self.graph_enabled = self.graph_requested and self.graph_disabled_reason is None
         if self.graph_requested and not self.graph_enabled:
-            self.graph_disabled_reason = "manual_negative_graph_unsupported_with_tensor_parallel"
             logger.warning(
-                "VibeVoice negative CFG CUDA Graph disabled: tensor_parallel_size=%d; "
+                "VibeVoice negative CFG CUDA Graph disabled: reason=%s "
+                "tensor_parallel_size=%d device_capability=%s attention=%s; "
                 "using compiled/eager auxiliary Qwen path",
+                self.graph_disabled_reason,
                 self.tensor_parallel_size,
+                self.device_capability,
+                list(self.attention_implementations),
             )
         self._compiled: nn.Module | None = None
         self._compile_verified = False
@@ -348,7 +418,7 @@ class NegativeCFGGraphRunner:
         with override_forward_context(static_context):
             for _ in range(2):
                 _ = self._call(static_ids, static_positions, static_embeds)
-            torch.cuda.synchronize(input_ids.device)
+            torch.accelerator.synchronize(input_ids.device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(
                 graph,

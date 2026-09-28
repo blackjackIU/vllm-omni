@@ -42,6 +42,8 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
+from .prompting import resample_waveform
+
 logger = init_logger(__name__)
 
 _SAMPLE_RATE = 24000
@@ -117,10 +119,7 @@ def _resample_reference(waveform: Any, sample_rate: int) -> np.ndarray:
         channel_axis = 0 if audio.shape[0] <= 8 else 1
         audio = audio.mean(dim=channel_axis)
     audio = audio.reshape(-1)
-    if int(sample_rate) != _SAMPLE_RATE:
-        import torchaudio
-
-        audio = torchaudio.functional.resample(audio, int(sample_rate), _SAMPLE_RATE)
+    audio = resample_waveform(audio, int(sample_rate), _SAMPLE_RATE)
     return audio.cpu().numpy().astype(np.float32, copy=False)
 
 
@@ -429,7 +428,10 @@ class LegacyVibeVoiceStreamingForConditionalGeneration(nn.Module):
             torch.backends.cudnn.benchmark = True
         if not _env_enabled("VLLM_OMNI_VIBEVOICE_COMPILE_DIFFUSION"):
             return
-        mode = os.environ.get("VLLM_OMNI_VIBEVOICE_COMPILE_MODE", "reduce-overhead")
+        # This legacy backend also mutates generation state across calls. Keep
+        # graph-tree ownership opt-in for the same portability reason as the
+        # native scheduler-driven backend.
+        mode = os.environ.get("VLLM_OMNI_VIBEVOICE_COMPILE_MODE", "default")
         try:
             prediction_head = self._model.model.prediction_head
             self._model.model.prediction_head = torch.compile(

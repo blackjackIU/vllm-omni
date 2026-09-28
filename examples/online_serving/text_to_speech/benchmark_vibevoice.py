@@ -8,6 +8,7 @@ import io
 import json
 import statistics
 import sys
+import threading
 import time
 import urllib.request
 import wave
@@ -31,7 +32,14 @@ def _audio_duration(payload: bytes) -> float:
         return 0.0
 
 
-def _request(url: str, body: dict, timeout: float) -> Result:
+def _request(
+    url: str,
+    body: dict,
+    timeout: float,
+    start_barrier: threading.Barrier | None = None,
+) -> Result:
+    if start_barrier is not None:
+        start_barrier.wait()
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -43,6 +51,20 @@ def _request(url: str, body: dict, timeout: float) -> Result:
         payload = response.read()
     latency = time.perf_counter() - started
     return Result(latency, _audio_duration(payload), len(payload))
+
+
+def _capabilities_url(speech_url: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(speech_url)
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, "/v1/audio/capabilities", "", "")
+    )
+
+
+def _fetch_capabilities(url: str, timeout: float) -> dict:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -68,6 +90,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--baseline-json", type=Path)
+    parser.add_argument(
+        "--capabilities-url",
+        help="Defaults to /v1/audio/capabilities on the speech server",
+    )
     parser.add_argument("--min-speedup", type=float, default=0.0)
     parser.add_argument(
         "--max-latency-ratio",
@@ -99,8 +125,22 @@ def main() -> None:
 
     started = time.perf_counter()
     results: list[Result] = []
-    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = [pool.submit(_request, args.url, body, args.timeout) for _ in range(args.requests)]
+    worker_count = min(args.concurrency, args.requests)
+    start_barrier = threading.Barrier(worker_count + 1)
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [
+            pool.submit(
+                _request,
+                args.url,
+                body,
+                args.timeout,
+                start_barrier if index < worker_count else None,
+            )
+            for index in range(args.requests)
+        ]
+        # Release the first full worker wave together, so the benchmark
+        # measures server batching rather than client submission jitter.
+        start_barrier.wait()
         for future in as_completed(futures):
             results.append(future.result())
     wall_s = time.perf_counter() - started
@@ -121,6 +161,27 @@ def main() -> None:
         "aggregate_rtf": wall_s / audio_s if audio_s > 0 else float("inf"),
         "bytes": sum(result.bytes_received for result in results),
     }
+    capabilities_url = args.capabilities_url or _capabilities_url(args.url)
+    try:
+        capabilities = _fetch_capabilities(
+            capabilities_url,
+            min(args.timeout, 30.0),
+        )
+        scheduler_evidence = capabilities.get("scheduler_evidence", {})
+        summary["scheduler_evidence"] = scheduler_evidence
+        summary["runtime_capabilities"] = {
+            key: capabilities.get(key)
+            for key in (
+                "continuous_batching",
+                "positive_cuda_graph_captured",
+                "negative_cuda_graph_enabled",
+                "negative_cuda_graph_disabled_reason",
+                "diffusion_compiled",
+                "codec_compiled",
+            )
+        }
+    except Exception as exc:
+        summary["capabilities_error"] = str(exc)
     print(f"requests={len(results)} concurrency={args.concurrency} wall_s={wall_s:.3f}")
     print(
         f"latency_s mean={summary['latency_mean_s']:.3f} "
@@ -131,6 +192,15 @@ def main() -> None:
         f"audio_s_per_s={audio_per_second:.4f} aggregate_rtf={summary['aggregate_rtf']:.4f}"
     )
     print(f"audio_s={audio_s:.3f} bytes={summary['bytes']}")
+    if scheduler_evidence := summary.get("scheduler_evidence"):
+        print(
+            "scheduler_max_batch_size="
+            f"{scheduler_evidence.get('scheduler_max_batch_size', 0)} "
+            "continuous_join_steps="
+            f"{scheduler_evidence.get('continuous_join_steps', 0)}"
+        )
+    elif capabilities_error := summary.get("capabilities_error"):
+        print(f"capabilities_warning={capabilities_error}")
 
     if args.baseline_json is not None:
         baseline = json.loads(args.baseline_json.read_text(encoding="utf-8"))

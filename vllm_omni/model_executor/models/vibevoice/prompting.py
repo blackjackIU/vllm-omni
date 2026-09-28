@@ -166,6 +166,48 @@ def normalize_reference_audio(audio: np.ndarray, target_db_fs: float = -25.0) ->
     return waveform.astype(np.float32, copy=False)
 
 
+def resample_waveform(
+    waveform: torch.Tensor,
+    sample_rate: int,
+    target_sample_rate: int = SAMPLE_RATE,
+) -> torch.Tensor:
+    """Resample mono PCM with an optional torchaudio fast/high-quality path.
+
+    A torch interpolation fallback keeps reference conditioning available on
+    environments whose PyTorch and torchaudio CUDA wheels do not match.
+    """
+    sample_rate = int(sample_rate)
+    target_sample_rate = int(target_sample_rate)
+    if sample_rate <= 0 or target_sample_rate <= 0:
+        raise ValueError(
+            "VibeVoice sample rates must be positive, got "
+            f"sample_rate={sample_rate}, target_sample_rate={target_sample_rate}"
+        )
+    waveform = waveform.reshape(-1)
+    if waveform.numel() == 0:
+        raise ValueError("VibeVoice reference waveform is empty")
+    if sample_rate == target_sample_rate:
+        return waveform
+    try:
+        import torchaudio
+
+        return torchaudio.functional.resample(
+            waveform,
+            sample_rate,
+            target_sample_rate,
+        )
+    except (ImportError, OSError, RuntimeError):
+        output_length = int(
+            math.ceil(waveform.shape[-1] * target_sample_rate / sample_rate)
+        )
+        return torch.nn.functional.interpolate(
+            waveform.reshape(1, 1, -1),
+            size=output_length,
+            mode="linear",
+            align_corners=False,
+        ).reshape(-1)
+
+
 def resample_and_normalize_reference(audio: Any, sample_rate: int) -> np.ndarray:
     """Canonical 24 kHz PCM used by prompt and conditioning cache keys."""
     waveform = torch.as_tensor(np.asarray(audio), dtype=torch.float32)
@@ -173,10 +215,7 @@ def resample_and_normalize_reference(audio: Any, sample_rate: int) -> np.ndarray
         channel_axis = 0 if waveform.shape[0] <= 8 else 1
         waveform = waveform.mean(dim=channel_axis)
     waveform = waveform.reshape(-1)
-    if int(sample_rate) != SAMPLE_RATE:
-        import torchaudio
-
-        waveform = torchaudio.functional.resample(waveform, int(sample_rate), SAMPLE_RATE)
+    waveform = resample_waveform(waveform, int(sample_rate), SAMPLE_RATE)
     return normalize_reference_audio(waveform.cpu().numpy())
 
 
@@ -190,5 +229,6 @@ __all__ = [
     "parse_script",
     "reference_frame_count",
     "resample_and_normalize_reference",
+    "resample_waveform",
     "resampled_num_samples",
 ]

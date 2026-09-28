@@ -42,7 +42,9 @@ stages:
       VLLM_OMNI_VIBEVOICE_COMPILE_CODEC: "1"
       # The auxiliary Qwen pass cannot reuse the runner-owned positive graph.
       # Compile it with Inductor graph trees disabled, then capture model-owned
-      # graphs for the common compact CFG batch widths.
+      # graphs for the common compact CFG batch widths. Runtime compatibility
+      # checks fail closed to compile/eager on pre-Ampere CUDA, Triton
+      # attention, non-CUDA platforms and tensor parallel deployments.
       VLLM_OMNI_VIBEVOICE_COMPILE_NEGATIVE_QWEN: "1"
       VLLM_OMNI_VIBEVOICE_GRAPH_NEGATIVE_QWEN: "1"
       VLLM_OMNI_VIBEVOICE_NEGATIVE_GRAPH_BATCH_SIZES: "1,2,4,8"

@@ -539,6 +539,10 @@ _DEEP_MERGE_KEYS = frozenset(
         "subtalker_sampling_params",
         "engine_extras",
         "engine_args",
+        # Deploy overlays commonly change one model-specific environment
+        # switch. Replacing the entire mapping silently drops safety and
+        # compile settings inherited from the base profile.
+        "env",
     }
 )
 

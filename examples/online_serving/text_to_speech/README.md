@@ -117,6 +117,7 @@ deactivate 2>/dev/null || true
 python3 -m venv /data/venvs/vllm-omni
 source /data/venvs/vllm-omni/bin/activate
 python -m pip install -U pip setuptools wheel uv huggingface_hub
+uv pip install vllm==0.27.0 --torch-backend=auto
 UV_LINK_MODE=copy VLLM_OMNI_TARGET_DEVICE=cuda uv pip install -e .
 
 unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
@@ -149,6 +150,16 @@ Native and reference deploy profiles are provided:
 
 `vibevoice.yaml`, `vibevoice_2gpu.yaml`, and `vibevoice_streaming.yaml` remain
 backward-compatible names for the corresponding native profiles.
+
+The manual negative-CFG CUDA Graph is treated as an optional optimization.
+It automatically falls back to the compiled/eager auxiliary Qwen path on
+pre-Ampere NVIDIA GPUs, Triton attention, ROCm/non-CUDA devices, and tensor
+parallel deployments. A missing `torchaudio` does not block ordinary
+`speed=1` serving; VibeVoice reference resampling uses a torch-only fallback.
+If an installed `torchaudio` wheel was built for a different CUDA version,
+remove it before launching the server because Transformers may import it
+during startup. Non-default output speed still requires a compatible
+`torchaudio` installation.
 
 Before moving the source to the GPU server, run the focused contract tests in
 an environment with the project development dependencies installed:
@@ -222,9 +233,10 @@ python3 examples/online_serving/text_to_speech/benchmark_vibevoice.py \
 ```
 
 It reports mean/p50/p95 latency, requests per second, and aggregate real-time
-factor. Keep the text, seed, DDPM steps, and concurrency fixed when comparing
-profiles. If a GPU runs out of memory on long scripts, lower `max_num_seqs`
-from 8 to 4 or 2 in the selected deploy YAML.
+factor. It also queries `/v1/audio/capabilities` and prints the maximum batch
+size observed by the live vLLM scheduler. Keep the text, seed, DDPM steps, and
+concurrency fixed when comparing profiles. If a GPU runs out of memory on long
+scripts, lower `max_num_seqs` from 8 to 4 or 2 in the selected deploy YAML.
 
 To make a release gate fail automatically, first save the legacy result and
 then compare the native run against it:

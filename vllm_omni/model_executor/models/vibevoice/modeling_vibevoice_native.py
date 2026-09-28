@@ -35,8 +35,8 @@ from vllm_omni.attention.auxiliary_stream import (
     AuxiliaryAttentionStreamSpec,
     AuxiliarySequenceState,
 )
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.metrics.vibevoice import VibeVoiceMetrics
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
 from .checkpoint import validate_vibevoice_checkpoint
@@ -1144,7 +1144,10 @@ class VibeVoiceNativeForConditionalGeneration(nn.Module):
         if self._side_compile_attempted or not torch.cuda.is_available():
             return
         self._side_compile_attempted = True
-        mode = os.getenv("VLLM_OMNI_VIBEVOICE_COMPILE_MODE", "reduce-overhead")
+        # Stateful codec caches are mutated in place. The ordinary Inductor
+        # mode is the portable default; profiles may opt into graph-tree modes
+        # only after validating them on their target hardware/backend.
+        mode = os.getenv("VLLM_OMNI_VIBEVOICE_COMPILE_MODE", "default")
         tensor_parallel_size = int(
             getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
         )
